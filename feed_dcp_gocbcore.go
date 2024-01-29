@@ -1207,7 +1207,7 @@ func (f *GocbcoreDCPFeed) rollback(vbId uint16, rollbackSeqno uint64) error {
 	vbMetaData, _, err := f.getMetaData(vbId)
 	if err == nil && len(vbMetaData.FailOverLog) > 0 {
 		for j := 0; j < len(vbMetaData.FailOverLog); j++ {
-			if vbMetaData.FailOverLog[j][1] <= rollbackSeqno {
+			if vbMetaData.FailOverLog[j][1] <= rollbackSeqno && vbMetaData.FailOverLog[j][1] != 0 {
 				rollbackVbuuid = vbMetaData.FailOverLog[j][0]
 				break
 			}
