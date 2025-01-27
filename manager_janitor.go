@@ -80,6 +80,8 @@ func (mgr *Manager) rollbackPIndex(pindex *PIndex) error {
 				log.Warnf("janitor: rollbackPIndex for pindex %s, "+
 					"RollbackHook, err: %v", pindex.Name, err)
 			}
+		} else {
+			mgr.JanitorKick("rollback PIndex")
 		}
 	}()
 
@@ -1499,7 +1501,6 @@ func (mgr *Manager) startFeed(pindexes []*PIndex) error {
 		pindexFirst.SourceUUID, pindexFirst.SourceParams,
 		dests)
 }
-
 
 func (mgr *Manager) stopPIndexFeeds(pindex *PIndex) error {
 	feeds, _ := mgr.CurrentMaps()
