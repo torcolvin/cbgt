@@ -784,7 +784,7 @@ func (f *GocbcoreDCPFeed) Start() error {
 		f.streamOptions.FilterOptions, f.streamOptions.StreamOptions, f.vbucketIds)
 
 	for _, vbid := range f.vbucketIds {
-		err := f.initiateStream(uint16(vbid))
+		err := f.InitiateStream(uint16(vbid))
 		if err != nil {
 			return fmt.Errorf("Start, name: %s, vbid: %v, err: %v",
 				f.Name(), vbid, err)
@@ -915,7 +915,7 @@ func (f *GocbcoreDCPFeed) lastVbUUIDSeqFromFailOverLog(vbId uint16) (
 	return vbuuid, lastSeq, nil
 }
 
-func (f *GocbcoreDCPFeed) initiateStream(vbId uint16) error {
+func (f *GocbcoreDCPFeed) InitiateStream(vbId uint16) error {
 	vbuuid, lastSeq, err := f.lastVbUUIDSeqFromFailOverLog(vbId)
 	if err != nil {
 		return err
