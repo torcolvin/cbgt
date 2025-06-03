@@ -88,6 +88,9 @@ type DCPFeedParams struct {
 
 	// Collections within the scope that the feed would cover.
 	Collections []string `json:"collections,omitempty"`
+
+	// AutomatedReconnectOnRollback is used to specify whether a rollback on stream open should reopen the vBucket stream.
+	AutomaticReconnectOnRollback bool `json:"automaticReconnectOnRollback,omitempty"`
 }
 
 // NewDCPFeedParams returns a DCPFeedParams initialized with default

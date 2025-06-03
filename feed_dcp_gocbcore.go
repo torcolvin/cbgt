@@ -1237,6 +1237,9 @@ func (f *GocbcoreDCPFeed) rollback(vbId uint16, rollbackSeqno uint64) error {
 			f.Name(), vbId, rollbackSeqno, rollbackVbuuid, err)
 	} else {
 		atomic.AddUint64(&f.dcpStats.TotDCPRollbacks, 1)
+		if f.params.AutomaticReconnectOnRollback {
+			f.initiateStream(vbId)
+		}
 	}
 
 	return err
