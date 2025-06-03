@@ -1,4 +1,4 @@
-module github.com/couchbase/cbgt
+module github.com/torcolvin/cbgt
 
 go 1.21
 
