@@ -89,6 +89,11 @@ type DCPFeedParams struct {
 	// Collections within the scope that the feed would cover.
 	Collections []string `json:"collections,omitempty"`
 
+	// CollectionMap specifies scopes and their collections for streaming.
+	// A nil or empty collection list for a scope streams all collections in
+	// that scope. When CollectionMap is set, Scope and Collections must be empty.
+	CollectionMap map[string][]string `json:"collectionMap,omitempty"`
+
 	// AutoReconnectAfterRollback can be used to automatically
 	// re-initiate a stream request upon rollback completion, as
 	// opposed to deferring that resposibility of setting up the

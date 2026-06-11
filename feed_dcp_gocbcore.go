@@ -453,6 +453,92 @@ type vbucketState struct {
 	snapSaved   bool // True when snapStart/snapEnd have been persisted
 }
 
+// CollectionIDs stores resolved scope and collection IDs populated during
+// stream setup and used for both stream filtering and source verification.
+type CollectionIDs struct {
+	scopeIDs    map[string]uint32            // scope name -> scope ID
+	collections map[string]map[string]uint32 // scope name -> collection name -> uid (specific collections only)
+	collToScope map[uint32]uint32            // collection uid -> scope uid (all streamed collections)
+
+	// singleScopeID is set when an entire scope is streamed without individual
+	// collection filtering. scopeIDForCollectionID returns it for any collection ID.
+	singleScopeID    uint32
+	hasSingleScopeID bool
+}
+
+func newCollectionIDs() CollectionIDs {
+	return CollectionIDs{
+		scopeIDs:    make(map[string]uint32),
+		collections: make(map[string]map[string]uint32),
+		collToScope: make(map[uint32]uint32),
+	}
+}
+
+// SetScopeID records the resolved ID for a scope name.
+func (c *CollectionIDs) SetScopeID(scopeName string, scopeID uint32) {
+	c.scopeIDs[scopeName] = scopeID
+}
+
+// AddCollection records a specific collection's resolved ID for both verification
+// and scope ID lookup. SetScopeID must be called for scopeName first.
+func (c *CollectionIDs) AddCollection(scopeName, collName string, collID uint32) {
+	if c.collections[scopeName] == nil {
+		c.collections[scopeName] = make(map[string]uint32)
+	}
+	c.collections[scopeName][collName] = collID
+	c.collToScope[collID] = c.scopeIDs[scopeName]
+}
+
+// setCollectionScopeID records only the collection→scope mapping without storing
+// the collection for verification. Used for entire-scope streaming entries.
+// SetScopeID must be called for scopeName first.
+func (c *CollectionIDs) setCollectionScopeID(collID uint32, scopeName string) {
+	c.collToScope[collID] = c.scopeIDs[scopeName]
+}
+
+// SetSingleScopeID records that all streamed collections belong to one scope.
+// Once set, scopeIDForCollectionID returns this ID for any collection ID.
+func (c *CollectionIDs) SetSingleScopeID(scopeID uint32) {
+	c.singleScopeID = scopeID
+	c.hasSingleScopeID = true
+}
+
+// ScopeID returns the resolved scope ID for the given scope name.
+func (c CollectionIDs) ScopeID(scopeName string) uint32 {
+	return c.scopeIDs[scopeName]
+}
+
+// HasScope reports whether the given scope name has a resolved ID.
+func (c CollectionIDs) HasScope(scopeName string) bool {
+	_, ok := c.scopeIDs[scopeName]
+	return ok
+}
+
+// GetCollectionID returns the resolved collection ID for the given scope and
+// collection name, and whether the entry was found.
+func (c CollectionIDs) GetCollectionID(scopeName, collectionName string) (uint32, bool) {
+	if colls, ok := c.collections[scopeName]; ok {
+		uid, ok := colls[collectionName]
+		return uid, ok
+	}
+	return 0, false
+}
+
+// scopeCollections returns the collection name→uid map for a scope, used during
+// source verification. Returns nil when the scope has no specific collections
+// (i.e., the entire scope is being streamed).
+func (c CollectionIDs) scopeCollections(scopeName string) map[string]uint32 {
+	return c.collections[scopeName]
+}
+
+// scopeIDForCollectionID returns the scope ID for the given collection ID.
+func (c CollectionIDs) scopeIDForCollectionID(collID uint32) uint32 {
+	if c.hasSingleScopeID {
+		return c.singleScopeID
+	}
+	return c.collToScope[collID]
+}
+
 // A GocbcoreDCPFeed implements both Feed and gocb.StreamObserver
 // interfaces, and forwards any incoming gocb.StreamObserver
 // callbacks to the relevant, hooked-up Dest instances.
@@ -476,12 +562,12 @@ type GocbcoreDCPFeed struct {
 	// if agent supports collections or not
 	supportsCollections bool
 
-	scope       string
-	collections []string
+	// collections maps scope names to collection names.
+	// A nil or empty collection slice means stream the entire scope.
+	collections map[string][]string
 
 	manifestUID   uint64
-	scopeID       uint32
-	collectionIDs []uint32
+	collectionIDs CollectionIDs
 
 	streamOptions gocbcore.OpenStreamOptions
 
@@ -676,12 +762,17 @@ func newGocbcoreDCPFeed(name, indexName, indexUUID, servers,
 		}
 	}
 
-	if len(params.Scope) == 0 && len(params.Collections) == 0 {
-		feed.scope = "_default"
-		feed.collections = []string{"_default"}
-	} else {
-		feed.scope = params.Scope
-		feed.collections = params.Collections
+	switch {
+	case len(params.CollectionMap) > 0:
+		if params.Scope != "" || len(params.Collections) > 0 {
+			return nil, feed.onSetupError(fmt.Errorf("newGocbcoreDCPFeed:" +
+				" CollectionMap cannot be used with Scope or Collections"))
+		}
+		feed.collections = params.CollectionMap
+	case params.Scope != "" || len(params.Collections) > 0:
+		feed.collections = map[string][]string{params.Scope: params.Collections}
+	default:
+		feed.collections = map[string][]string{"_default": {"_default"}}
 	}
 
 	// sort the vbucketIds list to determine the largest vbucketId
@@ -777,64 +868,88 @@ func (f *GocbcoreDCPFeed) setupStreamOptions(paramsStr string,
 
 	f.manifestUID = manifest.UID
 
-	var scopeIDFound bool
+	f.collectionIDs = newCollectionIDs()
+	scopeManifestColls := make(map[string][]gocbcore.ManifestCollection)
 	for _, manifestScope := range manifest.Scopes {
-		if manifestScope.Name == f.scope {
-			f.scopeID = manifestScope.UID
-			scopeIDFound = true
-			break
+		if _, ok := f.collections[manifestScope.Name]; ok {
+			f.collectionIDs.SetScopeID(manifestScope.Name, manifestScope.UID)
+			scopeManifestColls[manifestScope.Name] = manifestScope.Collections
 		}
 	}
 
-	if !scopeIDFound {
-		return fmt.Errorf("scope not found: %v", f.scope)
+	for scope := range f.collections {
+		if !f.collectionIDs.HasScope(scope) {
+			return fmt.Errorf("scope not found: %v", scope)
+		}
 	}
 
 	f.streamOptions.StreamOptions = &gocbcore.OpenStreamStreamOptions{
 		StreamID: newStreamID(),
 	}
 
-	if len(f.collections) == 0 {
-		// if no collections were specified, set up stream requests for
-		// the entire scope.
-		f.streamOptions.FilterOptions = &gocbcore.OpenStreamFilterOptions{
-			ScopeID: f.scopeID,
+	// Single scope with no specific collections: use ScopeID filter.
+	if len(f.collections) == 1 {
+		for scope, colls := range f.collections {
+			if len(colls) == 0 {
+				scopeID := f.collectionIDs.ScopeID(scope)
+				f.collectionIDs.SetSingleScopeID(scopeID)
+				f.streamOptions.FilterOptions = &gocbcore.OpenStreamFilterOptions{
+					ScopeID: scopeID,
+				}
+				return nil
+			}
 		}
-	} else {
-		for _, coll := range f.collections {
-			op, err = agent.GetCollectionID(f.scope, coll,
-				gocbcore.GetCollectionIDOptions{},
-				func(res *gocbcore.GetCollectionIDResult, er error) {
-					if er == nil && res == nil {
-						er = fmt.Errorf("collection ID not retrieved")
-					}
+	}
 
-					if er == nil {
-						if res.ManifestID != f.manifestUID {
-							er = fmt.Errorf("manifestID mismatch, %v != %v",
-								res.ManifestID, f.manifestUID)
-						} else {
-							f.collectionIDs =
-								append(f.collectionIDs, res.CollectionID)
+	// Multiple scopes or specific collections: resolve all collection IDs.
+	var allCollIDs []uint32
+
+	for scope, colls := range f.collections {
+		if len(colls) == 0 {
+			// Stream the entire scope: add all collection IDs from the manifest.
+			for _, manifestColl := range scopeManifestColls[scope] {
+				allCollIDs = append(allCollIDs, manifestColl.UID)
+				f.collectionIDs.setCollectionScopeID(manifestColl.UID, scope)
+			}
+		} else {
+			// Resolve specific collection IDs via GetCollectionID.
+			for _, collName := range colls {
+				currScope := scope
+				currColl := collName
+				op, err = agent.GetCollectionID(currScope, currColl,
+					gocbcore.GetCollectionIDOptions{},
+					func(res *gocbcore.GetCollectionIDResult, er error) {
+						if er == nil && res == nil {
+							er = fmt.Errorf("collection ID not retrieved")
 						}
-					}
 
-					signal <- er
-				})
-			if err != nil {
-				return fmt.Errorf("GetCollectionID, collection: %v, err: %v",
-					coll, err)
-			}
+						if er == nil {
+							if res.ManifestID != f.manifestUID {
+								er = fmt.Errorf("manifestID mismatch, %v != %v",
+									res.ManifestID, f.manifestUID)
+							} else {
+								f.collectionIDs.AddCollection(currScope, currColl, res.CollectionID)
+								allCollIDs = append(allCollIDs, res.CollectionID)
+							}
+						}
 
-			err = waitForResponse(signal, f.closeCh, op, GocbcoreStatsTimeout)
-			if err != nil {
-				return fmt.Errorf("failed to get collection ID, err : %v", err)
+						signal <- er
+					})
+				if err != nil {
+					return fmt.Errorf("GetCollectionID, collection: %v, err: %v",
+						currColl, err)
+				}
+
+				err = waitForResponse(signal, f.closeCh, op, GocbcoreStatsTimeout)
+				if err != nil {
+					return fmt.Errorf("failed to get collection ID, err: %v", err)
+				}
 			}
 		}
+	}
 
-		f.streamOptions.FilterOptions = &gocbcore.OpenStreamFilterOptions{
-			CollectionIDs: f.collectionIDs,
-		}
+	f.streamOptions.FilterOptions = &gocbcore.OpenStreamFilterOptions{
+		CollectionIDs: allCollIDs,
 	}
 
 	return nil
@@ -1466,25 +1581,37 @@ func (f *GocbcoreDCPFeed) checkIfSourceExists(force, waitForUpdate bool) (bool, 
 			return
 		}
 
-		for i := range manifestInfo.scopes {
-			if manifestInfo.scopes[i].name == f.scope {
-				sourceNotFound = false
-				// check if any of the source collections got deleted.
-			OUTER:
-				for j := range f.collectionIDs {
-					for _, coll := range manifestInfo.scopes[i].collections {
-						if f.collections[j] == coll.name &&
-							f.collectionIDs[j] == coll.uid {
-							continue OUTER
+		for scope, colls := range f.collections {
+			scopeFound := false
+			for i := range manifestInfo.scopes {
+				if manifestInfo.scopes[i].name == scope {
+					scopeFound = true
+					if len(colls) == 0 {
+						break
+					}
+					for collName, collUID := range f.collectionIDs.scopeCollections(scope) {
+						found := false
+						for _, coll := range manifestInfo.scopes[i].collections {
+							if collName == coll.name && collUID == coll.uid {
+								found = true
+								break
+							}
+						}
+						if !found {
+							sourceNotFound = true
+							indexUUID = f.indexUUID
+							return
 						}
 					}
-					sourceNotFound = true
-					indexUUID = f.indexUUID
-					return
+					break
 				}
-				break
+			}
+			if !scopeFound {
+				indexUUID = f.indexUUID
+				return
 			}
 		}
+		sourceNotFound = false
 		indexUUID = f.indexUUID
 	}()
 
@@ -1538,27 +1665,39 @@ func (f *GocbcoreDCPFeed) cacheUpdateCheck(bucketScopeInfoMap map[string]*Bucket
 
 	// as any collection lifecycle events affects the scope UUID, skipping
 	// that for the comparisons here.
-	var scopeFound bool
 	manifestInfo := bucketScopeInfo.scopeManifestInfo
-	for i := range manifestInfo.scopes {
-		if manifestInfo.scopes[i].name == f.scope {
-			scopeFound = true
-			// check if any of the source collections got deleted.
-		OUTER:
-			for j := range f.collectionIDs {
-				for _, coll := range manifestInfo.scopes[i].collections {
-					if f.collections[j] == coll.name &&
-						f.collectionIDs[j] == coll.uid {
-						continue OUTER
+	for scope, colls := range f.collections {
+		scopeFound := false
+		for i := range manifestInfo.scopes {
+			if manifestInfo.scopes[i].name == scope {
+				scopeFound = true
+				if len(colls) > 0 {
+					for collName, collUID := range f.collectionIDs.scopeCollections(scope) {
+						found := false
+						for _, coll := range manifestInfo.scopes[i].collections {
+							if collName == coll.name && collUID == coll.uid {
+								found = true
+								break
+							}
+						}
+						if !found {
+							return false
+						}
 					}
 				}
-				return false
+				break
 			}
-			break
+		}
+		if !scopeFound {
+			return false
 		}
 	}
+	return true
+}
 
-	return scopeFound
+// scopeIDForCollection returns the scope ID for the given collection ID.
+func (f *GocbcoreDCPFeed) scopeIDForCollection(collID uint32) uint32 {
+	return f.collectionIDs.scopeIDForCollectionID(collID)
 }
 
 func (f *GocbcoreDCPFeed) GetBucketDetails() (string, string) {
